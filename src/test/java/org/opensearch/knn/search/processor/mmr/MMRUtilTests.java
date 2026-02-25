@@ -5,358 +5,317 @@
 
 package org.opensearch.knn.search.processor.mmr;
 
-import org.apache.lucene.tests.util.LuceneTestCase;
-import org.junit.Test;
-import org.opensearch.index.mapper.ObjectMapper;
+import org.mockito.ArgumentCaptor;
+import org.opensearch.action.search.SearchRequest;
+import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.MappingMetadata;
+import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.index.Index;
+import org.opensearch.knn.index.SpaceType;
+import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.mapper.KNNVectorFieldMapper;
+import org.opensearch.knn.search.extension.MMRSearchExtBuilder;
+import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.pipeline.ProcessorGenerationContext;
+import org.opensearch.transport.client.Client;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
-/**
- * Unit tests for MMRUtil utility class
- */
-public class MMRUtilTests extends LuceneTestCase {
+import static org.mockito.Mockito.*;
+import static org.opensearch.knn.common.KNNConstants.*;
+import static org.opensearch.knn.search.processor.mmr.MMRUtil.getMMRFieldMappingByPath;
 
-    // ========== Tests for extractVectorFromHit ==========
+public class MMRUtilTests extends MMRTestCase {
+    private Client mockClient;
+    private ActionListener<MMRVectorFieldInfo> listener;
 
-    @Test
-    public void testExtractVectorFromHit_SimpleFloatVector() {
-        Map<String, Object> source = Map.of("embedding", List.of(0.1, 0.2, 0.3, 0.4));
-
-        float[] result = (float[]) MMRUtil.extractVectorFromHit(source, "embedding", "doc-1", true);
-
-        assertNotNull(result);
-        assertEquals(4, result.length);
-        assertEquals(0.1f, result[0], 0.0001f);
-        assertEquals(0.2f, result[1], 0.0001f);
-        assertEquals(0.3f, result[2], 0.0001f);
-        assertEquals(0.4f, result[3], 0.0001f);
+    @Override
+    public void setUp() throws Exception {
+        super.setUp();
+        mockClient = mock(Client.class);
+        listener = mock(ActionListener.class);
     }
 
-    @Test
-    public void testExtractVectorFromHit_SimpleByteVector() {
-        Map<String, Object> source = Map.of("embedding", List.of(1.0, 2.0, 3.0, 127.0));
+    public void testExtractVectorFromHit_whenValidList_thenReturnFloatArray() {
+        Map<String, Object> source = new HashMap<>();
+        source.put("embedding", Arrays.asList(0.1, 0.2, 0.3));
 
-        byte[] result = (byte[]) MMRUtil.extractVectorFromHit(source, "embedding", "doc-1", false);
+        float[] result = (float[]) MMRUtil.extractVectorFromHit(source, "embedding", "doc1", true);
 
-        assertNotNull(result);
-        assertEquals(4, result.length);
-        assertEquals((byte) 1, result[0]);
-        assertEquals((byte) 2, result[1]);
-        assertEquals((byte) 3, result[2]);
-        assertEquals((byte) 127, result[3]);
+        assertArrayEquals(new float[] { 0.1f, 0.2f, 0.3f }, result, 0.0001f);
     }
 
-    @Test
-    public void testExtractVectorFromHit_NestedPath() {
-        Map<String, Object> source = Map.of("user", Map.of("profile", Map.of("embedding", List.of(1.0, 2.0, 3.0))));
+    public void testExtractVectorFromHit_whenInvalidElementType_thenThrow() {
+        Map<String, Object> source = new HashMap<>();
+        source.put("embedding", Arrays.asList(1.0, "bad"));
 
-        float[] result = (float[]) MMRUtil.extractVectorFromHit(source, "user.profile.embedding", "doc-2", true);
-
-        assertNotNull(result);
-        assertEquals(3, result.length);
-        assertEquals(1.0f, result[0], 0.0001f);
-        assertEquals(2.0f, result[1], 0.0001f);
-        assertEquals(3.0f, result[2], 0.0001f);
+        IllegalArgumentException ex = assertThrows(
+            IllegalArgumentException.class,
+            () -> MMRUtil.extractVectorFromHit(source, "embedding", "doc1", true)
+        );
+        assertTrue(ex.getMessage().contains("unexpected value at the vector field"));
     }
 
-    @Test
-    public void testExtractVectorFromHit_DeepNestedPath() {
-        Map<String, Object> source = Map.of("level1", Map.of("level2", Map.of("level3", Map.of("vector", List.of(5.5, 6.6)))));
+    public void testExtractVectorFromHit_whenFieldNotFound_thenThrow() {
+        Map<String, Object> source = new HashMap<>();
 
-        float[] result = (float[]) MMRUtil.extractVectorFromHit(source, "level1.level2.level3.vector", "doc-3", true);
-
-        assertNotNull(result);
-        assertEquals(2, result.length);
-        assertEquals(5.5f, result[0], 0.0001f);
-        assertEquals(6.6f, result[1], 0.0001f);
+        IllegalArgumentException ex = assertThrows(
+            IllegalArgumentException.class,
+            () -> MMRUtil.extractVectorFromHit(source, "missing", "doc1", true)
+        );
+        assertTrue(ex.getMessage().contains("not found"));
     }
 
-    @Test
-    public void testExtractVectorFromHit_EmptyVector() {
-        Map<String, Object> source = Map.of("embedding", List.of());
+    public void testResolveKnnVectorFieldInfo_whenAllUnmappedField_thenDefaultFieldInfo() {
+        String vectorFieldPath = "field";
+        SpaceType userProvidedSpaceType = null;
+        VectorDataType userProvidedVectorDataType = null;
 
-        float[] result = (float[]) MMRUtil.extractVectorFromHit(source, "embedding", "doc-4", true);
-
-        assertNotNull(result);
-        assertEquals(0, result.length);
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void testExtractVectorFromHit_NullSource() {
-        MMRUtil.extractVectorFromHit(null, "embedding", "doc-5", true);
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void testExtractVectorFromHit_NullFieldPath() {
-        Map<String, Object> source = Map.of("embedding", List.of(1.0, 2.0));
-        MMRUtil.extractVectorFromHit(source, null, "doc-6", true);
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void testExtractVectorFromHit_EmptyFieldPath() {
-        Map<String, Object> source = Map.of("embedding", List.of(1.0, 2.0));
-        MMRUtil.extractVectorFromHit(source, "", "doc-7", true);
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void testExtractVectorFromHit_MissingField() {
-        Map<String, Object> source = Map.of("other_field", "value");
-        MMRUtil.extractVectorFromHit(source, "embedding", "doc-8", true);
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void testExtractVectorFromHit_MissingNestedField() {
-        Map<String, Object> source = Map.of("user", Map.of("name", "John"));
-        MMRUtil.extractVectorFromHit(source, "user.profile.embedding", "doc-9", true);
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void testExtractVectorFromHit_NonMapInPath() {
-        Map<String, Object> source = Map.of("user", "not_a_map");
-        MMRUtil.extractVectorFromHit(source, "user.embedding", "doc-10", true);
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void testExtractVectorFromHit_NonListAtEnd() {
-        Map<String, Object> source = Map.of("embedding", "not_a_vector");
-        MMRUtil.extractVectorFromHit(source, "embedding", "doc-11", true);
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void testExtractVectorFromHit_InvalidVectorContent() {
-        Map<String, Object> source = Map.of("embedding", List.of("not", "numbers"));
-        MMRUtil.extractVectorFromHit(source, "embedding", "doc-12", true);
-    }
-
-    // ========== Tests for getMMRFieldMappingByPath ==========
-
-    @Test
-    public void testGetMMRFieldMappingByPath_SimpleField() {
-        Map<String, Object> mappings = Map.of(
-            "properties",
-            Map.of("embedding", Map.of("type", "knn_vector", "dimension", 128, "space_type", "l2"))
+        MMRUtil.resolveKnnVectorFieldInfo(
+            vectorFieldPath,
+            userProvidedSpaceType,
+            userProvidedVectorDataType,
+            List.of(createMockIndexMetadata(Collections.emptyMap())),
+            mockClient,
+            listener
         );
 
-        Map<String, Object> result = MMRUtil.getMMRFieldMappingByPath(mappings, "embedding");
-
-        assertNotNull(result);
-        assertEquals("knn_vector", result.get("type"));
-        assertEquals(128, result.get("dimension"));
-        assertEquals("l2", result.get("space_type"));
+        verifyVectorFieldInfo(listener, new MMRVectorFieldInfo(SpaceType.L2, VectorDataType.DEFAULT));
     }
 
-    @Test
-    public void testGetMMRFieldMappingByPath_NestedField() {
-        Map<String, Object> mappings = Map.of(
+    public void testResolveKnnVectorFieldInfo_whenAllUnmappedField_thenUserProvidedFieldInfo() {
+        String vectorFieldPath = "field";
+        SpaceType userProvidedSpaceType = SpaceType.COSINESIMIL;
+        VectorDataType userProvidedVectorDataType = VectorDataType.FLOAT;
+
+        MMRUtil.resolveKnnVectorFieldInfo(
+            vectorFieldPath,
+            userProvidedSpaceType,
+            userProvidedVectorDataType,
+            List.of(createMockIndexMetadata(Collections.emptyMap())),
+            mockClient,
+            listener
+        );
+
+        verifyVectorFieldInfo(listener, new MMRVectorFieldInfo(SpaceType.COSINESIMIL, VectorDataType.FLOAT));
+    }
+
+    public void testResolveKnnVectorFieldInfo_whenNonKnnField_thenException() {
+        String vectorFieldPath = "field";
+        SpaceType userProvidedSpaceType = null;
+        VectorDataType userProvidedVectorDataType = null;
+        Map<String, Object> mapping = Map.of("properties", Map.of("field", Map.of(TYPE, "keyword")));
+
+        MMRUtil.resolveKnnVectorFieldInfo(
+            vectorFieldPath,
+            userProvidedSpaceType,
+            userProvidedVectorDataType,
+            List.of(createMockIndexMetadata(mapping)),
+            mockClient,
+            listener
+        );
+
+        String expectedError = "MMR query extension cannot support non knn_vector field [index:field].";
+        verifyException(listener, IllegalArgumentException.class, expectedError);
+    }
+
+    public void testResolveKnnVectorFieldInfo_whenDifferentSpaceTypes_thenException() {
+        String vectorFieldPath = "field";
+        SpaceType userProvidedSpaceType = null;
+        VectorDataType userProvidedVectorDataType = null;
+        Map<String, Object> mapping = Map.of(
+            "properties",
+            Map.of("field", Map.of(TYPE, KNNVectorFieldMapper.CONTENT_TYPE, TOP_LEVEL_PARAMETER_SPACE_TYPE, SpaceType.L2.getValue()))
+        );
+        Map<String, Object> mapping1 = Map.of(
             "properties",
             Map.of(
-                "user",
+                "field",
                 Map.of(
-                    "properties",
-                    Map.of("profile", Map.of("properties", Map.of("embedding", Map.of("type", "knn_vector", "dimension", 256))))
+                    TYPE,
+                    KNNVectorFieldMapper.CONTENT_TYPE,
+                    KNN_METHOD,
+                    Map.of(METHOD_PARAMETER_SPACE_TYPE, SpaceType.COSINESIMIL.getValue())
                 )
             )
         );
 
-        Map<String, Object> result = MMRUtil.getMMRFieldMappingByPath(mappings, "user.profile.embedding");
+        MMRUtil.resolveKnnVectorFieldInfo(
+            vectorFieldPath,
+            userProvidedSpaceType,
+            userProvidedVectorDataType,
+            List.of(createMockIndexMetadata(mapping), createMockIndexMetadata(mapping1)),
+            mockClient,
+            listener
+        );
 
-        assertNotNull(result);
-        assertEquals("knn_vector", result.get("type"));
-        assertEquals(256, result.get("dimension"));
+        String expectedError =
+            "MMR query extension cannot support different space type [l2, cosinesimil] for the knn_vector field at path field.";
+        verifyException(listener, IllegalArgumentException.class, expectedError);
     }
 
-    @Test
-    public void testGetMMRFieldMappingByPath_NonKnnField() {
-        Map<String, Object> mappings = Map.of("properties", Map.of("title", Map.of("type", "text")));
-
-        Map<String, Object> result = MMRUtil.getMMRFieldMappingByPath(mappings, "title");
-
-        assertNotNull(result);
-        assertEquals("text", result.get("type"));
-    }
-
-    @Test
-    public void testGetMMRFieldMappingByPath_MissingField() {
-        Map<String, Object> mappings = Map.of("properties", Map.of("other_field", Map.of("type", "text")));
-
-        Map<String, Object> result = MMRUtil.getMMRFieldMappingByPath(mappings, "embedding");
-
-        assertNull(result);
-    }
-
-    @Test
-    public void testGetMMRFieldMappingByPath_NullMappings() {
-        Map<String, Object> result = MMRUtil.getMMRFieldMappingByPath(null, "embedding");
-        assertNull(result);
-    }
-
-    @Test
-    public void testGetMMRFieldMappingByPath_NoProperties() {
-        Map<String, Object> mappings = Map.of("settings", Map.of("index", "value"));
-
-        Map<String, Object> result = MMRUtil.getMMRFieldMappingByPath(mappings, "embedding");
-
-        assertNull(result);
-    }
-
-    @Test
-    public void testGetMMRFieldMappingByPath_PropertiesNotMap() {
-        Map<String, Object> mappings = Map.of("properties", "not_a_map");
-
-        Map<String, Object> result = MMRUtil.getMMRFieldMappingByPath(mappings, "embedding");
-
-        assertNull(result);
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void testGetMMRFieldMappingByPath_NestedFieldType() {
-        Map<String, Object> mappings = Map.of(
+    public void testResolveKnnVectorFieldInfo_whenDifferentVectorDataTypes_thenException() {
+        String vectorFieldPath = "field";
+        SpaceType userProvidedSpaceType = null;
+        VectorDataType userProvidedVectorDataType = null;
+        Map<String, Object> mapping = Map.of(
             "properties",
             Map.of(
-                "nested_field",
+                "field",
                 Map.of(
-                    "type",
-                    ObjectMapper.NESTED_CONTENT_TYPE,
-                    "properties",
-                    Map.of("embedding", Map.of("type", "knn_vector", "dimension", 128))
+                    TYPE,
+                    KNNVectorFieldMapper.CONTENT_TYPE,
+                    VECTOR_DATA_TYPE_FIELD,
+                    VectorDataType.BINARY.getValue(),
+                    TOP_LEVEL_PARAMETER_SPACE_TYPE,
+                    SpaceType.L2.getValue()
+                )
+            )
+        );
+        Map<String, Object> mapping1 = Map.of(
+            "properties",
+            Map.of(
+                "field",
+                Map.of(
+                    TYPE,
+                    KNNVectorFieldMapper.CONTENT_TYPE,
+                    VECTOR_DATA_TYPE_FIELD,
+                    VectorDataType.FLOAT.getValue(),
+                    KNN_METHOD,
+                    Map.of(METHOD_PARAMETER_SPACE_TYPE, SpaceType.L2.getValue())
                 )
             )
         );
 
-        // Should throw IllegalArgumentException because nested fields are not supported
-        MMRUtil.getMMRFieldMappingByPath(mappings, "nested_field.embedding");
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void testGetMMRFieldMappingByPath_NestedInMiddleOfPath() {
-        Map<String, Object> mappings = Map.of(
-            "properties",
-            Map.of(
-                "level1",
-                Map.of(
-                    "properties",
-                    Map.of(
-                        "nested_level",
-                        Map.of("type", ObjectMapper.NESTED_CONTENT_TYPE, "properties", Map.of("embedding", Map.of("type", "knn_vector")))
-                    )
-                )
-            )
+        MMRUtil.resolveKnnVectorFieldInfo(
+            vectorFieldPath,
+            userProvidedSpaceType,
+            userProvidedVectorDataType,
+            List.of(createMockIndexMetadata(mapping), createMockIndexMetadata(mapping1)),
+            mockClient,
+            listener
         );
 
-        MMRUtil.getMMRFieldMappingByPath(mappings, "level1.nested_level.embedding");
+        String expectedError =
+            "MMR query extension cannot support different vector data type [binary, float] for the knn_vector field at path field.";
+        verifyException(listener, IllegalArgumentException.class, expectedError);
     }
 
-    @Test
-    public void testGetMMRFieldMappingByPath_ObjectFieldType() {
-        // Object type (not nested) should be allowed
-        Map<String, Object> mappings = Map.of(
+    public void testResolveKnnVectorFieldInfo_whenDifferentUserProvidedSpaceTypes_thenException() {
+        String vectorFieldPath = "field";
+        SpaceType userProvidedSpaceType = SpaceType.COSINESIMIL;
+        VectorDataType userProvidedVectorDataType = null;
+        Map<String, Object> mapping = Map.of(
             "properties",
-            Map.of("user", Map.of("type", "object", "properties", Map.of("embedding", Map.of("type", "knn_vector", "dimension", 64))))
+            Map.of("field", Map.of(TYPE, KNNVectorFieldMapper.CONTENT_TYPE, TOP_LEVEL_PARAMETER_SPACE_TYPE, SpaceType.L2.getValue()))
         );
 
-        Map<String, Object> result = MMRUtil.getMMRFieldMappingByPath(mappings, "user.embedding");
-
-        assertNotNull(result);
-        assertEquals("knn_vector", result.get("type"));
-        assertEquals(64, result.get("dimension"));
-    }
-
-    @Test
-    public void testGetMMRFieldMappingByPath_FieldWithoutType() {
-        // Field without explicit type (implicit object)
-        Map<String, Object> mappings = Map.of(
-            "properties",
-            Map.of("user", Map.of("properties", Map.of("embedding", Map.of("type", "knn_vector"))))
+        MMRUtil.resolveKnnVectorFieldInfo(
+            vectorFieldPath,
+            userProvidedSpaceType,
+            userProvidedVectorDataType,
+            List.of(createMockIndexMetadata(mapping)),
+            mockClient,
+            listener
         );
 
-        Map<String, Object> result = MMRUtil.getMMRFieldMappingByPath(mappings, "user.embedding");
-
-        assertNotNull(result);
-        assertEquals("knn_vector", result.get("type"));
+        String expectedError =
+            "The space type [cosinesimil] provided in the MMR query extension does not match the space type [l2] in target indices.";
+        verifyException(listener, IllegalArgumentException.class, expectedError);
     }
 
-    // ========== Edge case and integration tests ==========
+    public void testResolveKnnVectorFieldInfo_whenDifferentUserProvidedVectorDataTypes_thenException() {
+        String vectorFieldPath = "field";
+        SpaceType userProvidedSpaceType = null;
+        VectorDataType userProvidedVectorDataType = VectorDataType.FLOAT;
+        Map<String, Object> mapping = Map.of(
+            "properties",
+            Map.of("field", Map.of(TYPE, KNNVectorFieldMapper.CONTENT_TYPE, VECTOR_DATA_TYPE_FIELD, VectorDataType.BYTE.getValue()))
+        );
 
-    @Test
-    public void testExtractVectorFromHit_LargeVector() {
-        List<Double> largeVector = new ArrayList<>();
-        for (int i = 0; i < 1000; i++) {
-            largeVector.add((double) i);
-        }
+        MMRUtil.resolveKnnVectorFieldInfo(
+            vectorFieldPath,
+            userProvidedSpaceType,
+            userProvidedVectorDataType,
+            List.of(createMockIndexMetadata(mapping)),
+            mockClient,
+            listener
+        );
 
-        Map<String, Object> source = Map.of("embedding", largeVector);
-
-        float[] result = (float[]) MMRUtil.extractVectorFromHit(source, "embedding", "doc-large", true);
-
-        assertNotNull(result);
-        assertEquals(1000, result.length);
-        for (int i = 0; i < 1000; i++) {
-            assertEquals((float) i, result[i], 0.0001f);
-        }
+        String expectedError =
+            "The vector data type [float] provided in the MMR query extension does not match the vector data type [byte] in target indices.";
+        verifyException(listener, IllegalArgumentException.class, expectedError);
     }
 
-    @Test
-    public void testExtractVectorFromHit_NegativeValues() {
-        Map<String, Object> source = Map.of("embedding", List.of(-1.5, -2.5, -3.5));
+    public void testResolveKnnVectorFieldInfo_whenMappedFieldNoInfo_thenDefaultFieldInfo() {
+        String vectorFieldPath = "field";
+        SpaceType userProvidedSpaceType = null;
+        VectorDataType userProvidedVectorDataType = null;
+        Map<String, Object> mapping = Map.of("properties", Map.of("field", Map.of(TYPE, KNNVectorFieldMapper.CONTENT_TYPE)));
 
-        float[] result = (float[]) MMRUtil.extractVectorFromHit(source, "embedding", "doc-negative", true);
+        MMRUtil.resolveKnnVectorFieldInfo(
+            vectorFieldPath,
+            userProvidedSpaceType,
+            userProvidedVectorDataType,
+            List.of(createMockIndexMetadata(mapping)),
+            mockClient,
+            listener
+        );
 
-        assertNotNull(result);
-        assertEquals(3, result.length);
-        assertEquals(-1.5f, result[0], 0.0001f);
-        assertEquals(-2.5f, result[1], 0.0001f);
-        assertEquals(-3.5f, result[2], 0.0001f);
+        verifyVectorFieldInfo(listener, new MMRVectorFieldInfo(SpaceType.L2, VectorDataType.DEFAULT));
     }
 
-    @Test
-    public void testExtractVectorFromHit_MixedPositiveNegative() {
-        Map<String, Object> source = Map.of("embedding", List.of(-1.0, 0.0, 1.0, -0.5, 0.5));
-
-        float[] result = (float[]) MMRUtil.extractVectorFromHit(source, "embedding", "doc-mixed", true);
-
-        assertNotNull(result);
-        assertEquals(5, result.length);
-        assertEquals(-1.0f, result[0], 0.0001f);
-        assertEquals(0.0f, result[1], 0.0001f);
-        assertEquals(1.0f, result[2], 0.0001f);
-        assertEquals(-0.5f, result[3], 0.0001f);
-        assertEquals(0.5f, result[4], 0.0001f);
+    private IndexMetadata createMockIndexMetadata(Map<String, Object> mappings) {
+        IndexMetadata indexMetadata = mock(IndexMetadata.class);
+        MappingMetadata mappingMetadata = mock(MappingMetadata.class);
+        when(indexMetadata.getIndex()).thenReturn(new Index("index", "uuid"));
+        when(indexMetadata.mapping()).thenReturn(mappingMetadata);
+        when(mappingMetadata.sourceAsMap()).thenReturn(mappings);
+        return indexMetadata;
     }
 
-    @Test
-    public void testGetMMRFieldMappingByPath_ComplexMapping() {
+    private void verifyVectorFieldInfo(ActionListener<MMRVectorFieldInfo> listener, MMRVectorFieldInfo vectorFieldInfo) {
+        ArgumentCaptor<MMRVectorFieldInfo> captor = ArgumentCaptor.forClass(MMRVectorFieldInfo.class);
+        verify(listener).onResponse(captor.capture());
+        SpaceType capturedSpaceType = captor.getValue().getSpaceType();
+        VectorDataType capturedVectorDataType = captor.getValue().getVectorDataType();
+        assertEquals(vectorFieldInfo.getSpaceType(), capturedSpaceType);
+        assertEquals(vectorFieldInfo.getVectorDataType(), capturedVectorDataType);
+    }
+
+    public void testShouldGenerateMMRProcessor_whenExtContainsBuilder_thenReturnTrue() {
+        SearchRequest searchRequest = new SearchRequest();
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        searchSourceBuilder.ext(Collections.singletonList(new MMRSearchExtBuilder.Builder().build()));
+        searchRequest.source(searchSourceBuilder);
+
+        ProcessorGenerationContext ctx = new ProcessorGenerationContext(searchRequest);
+
+        assertTrue(MMRUtil.shouldGenerateMMRProcessor(ctx));
+    }
+
+    public void testShouldGenerateMMRProcessor_whenNoExt_thenReturnFalse() {
+        SearchRequest searchRequest = new SearchRequest();
+
+        ProcessorGenerationContext ctx = new ProcessorGenerationContext(searchRequest);
+
+        assertFalse(MMRUtil.shouldGenerateMMRProcessor(ctx));
+    }
+
+    public void testGetMMRFieldMappingByPath_whenInNestedField_thenException() {
         Map<String, Object> mappings = new HashMap<>();
+        Map<String, Object> userMapping = new HashMap<>();
+        userMapping.put("type", "nested");
+
         Map<String, Object> properties = new HashMap<>();
-
-        Map<String, Object> userField = new HashMap<>();
-        Map<String, Object> userProperties = new HashMap<>();
-
-        Map<String, Object> profileField = new HashMap<>();
-        Map<String, Object> profileProperties = new HashMap<>();
-
-        Map<String, Object> embeddingField = new HashMap<>();
-        embeddingField.put("type", KNNVectorFieldMapper.CONTENT_TYPE);
-        embeddingField.put("dimension", 512);
-        embeddingField.put("space_type", "cosinesimil");
-
-        profileProperties.put("embedding", embeddingField);
-        profileField.put("properties", profileProperties);
-
-        userProperties.put("profile", profileField);
-        userField.put("properties", userProperties);
-
-        properties.put("user", userField);
+        properties.put("user", userMapping);
         mappings.put("properties", properties);
 
-        Map<String, Object> result = MMRUtil.getMMRFieldMappingByPath(mappings, "user.profile.embedding");
+        String fieldPath = "user.profile.age";
 
-        assertNotNull(result);
-        assertEquals(KNNVectorFieldMapper.CONTENT_TYPE, result.get("type"));
-        assertEquals(512, result.get("dimension"));
-        assertEquals("cosinesimil", result.get("space_type"));
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class, () -> getMMRFieldMappingByPath(mappings, fieldPath));
+
+        String expectedError = "MMR search extension cannot support the field user.profile.age because it is in the nested field user.";
+        assertEquals(expectedError, ex.getMessage());
     }
 }
